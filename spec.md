@@ -174,7 +174,8 @@ This is not an implementation decision, but a recommended direction that current
 At minimum, the following set of abstractions is recommended:
 
 - `EventSourceClientInterface`
-  - retrieves events from a specific source after the given `lastEventId`
+  - retrieves events from a specific source after the given `lastEventId`.
+  - method signature (core contract): `fetch(string $sourceName, int $afterEventId, int $limit = 1000): Event[]` — the method returns an array of `Event` objects and MUST NOT return protocol-specific types
 - `EventStorageInterface`
   - durably stores a batch of events
 - `EventSourceRegistryInterface`
@@ -191,7 +192,9 @@ At minimum, the following set of abstractions is recommended:
 - `LoggerInterface`
   - logs errors and source unavailability
 
-Implementation note: these abstractions will be defined as PHP `interface`s and modeled as Symfony services in the reference implementation. Implementations (clients, storage, lease manager) should be registered in the Symfony service container and wired via dependency injection. Use Composer for dependency management and PSR‑4 autoloading.
+Implementation note: these abstractions will be defined as PHP `interface`s and modeled as Symfony services in the reference implementation. The reference implementation MUST provide only the PHP `interface` definitions and Symfony wiring (service configuration); concrete infra adapters/clients (HTTP, gRPC, queue clients) and storage backends are explicitly OUT OF SCOPE for the first version and do not need to be implemented. Use Composer for dependency management and PSR‑4 autoloading.
+
+ The loader will perform exactly one fetch operation per acquired lease.
 
 ### 8.2 Coordination mechanism
 
