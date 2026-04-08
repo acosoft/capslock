@@ -70,7 +70,7 @@ Each event source:
 
 - has a unique name
 - is available over the network
-- supports retrieval of events strictly greater than a given event ID
+- supports retrieval of events strictly greater than a given `sourceEventId`
 - returns at most 1000 events per request
 
 ### 5.2 Event
@@ -78,8 +78,9 @@ Each event source:
 For the purposes of the core, it is sufficient to assume:
 
 - `sourceName` identifies the source
-- `eventId` is unique within a source
-- `eventId` grows monotonically over time
+- `sourceEventId` is unique within a source
+- `sourceEventId` grows monotonically over time
+- `sourceEventId` represents the source's external event identifier. Persistent storage MAY use an internal primary key for each stored row, but MUST also persist the `sourceEventId` so it can be used as the authoritative checkpoint.
 - an event payload exists, but the loader core does not need to know its internal format
 - events are immutable, which reduces the business risk of duplicate processing at the storage level; however, immutability does not remove the coordination requirement to avoid duplicate network retrieval.
 
@@ -96,7 +97,7 @@ A single loader instance:
 
 ### FR-1 Retrieval by checkpoint
 
-For each source, the system must retrieve events with the condition `eventId > lastStoredEventId`.
+For each source, the system must retrieve events with the condition `sourceEventId > lastStoredSourceEventId`.
 
 ### FR-2 Batch limit
 
@@ -174,17 +175,22 @@ This is not an implementation decision, but a recommended direction that current
 At minimum, the following set of abstractions is recommended:
 
 - `EventSourceClientInterface`
-  - retrieves events from a specific source after the given `lastEventId`.
-  - method signature (core contract): `fetch(string $sourceName, int $afterEventId, int $limit = 1000): Event[]` — the method returns an array of `Event` objects and MUST NOT return protocol-specific types
+ - `EventSourceClientInterface`
+  - retrieves events from a specific source after the given `lastStoredSourceEventId`.
+  - method signature (core contract): `fetch(string $sourceName, int $afterSourceEventId, int $limit = 1000): Event[]` — the method returns an array of `Event` objects and MUST NOT return protocol-specific types
 - `EventStorageInterface`
+ - `EventStorageInterface`
   - durably stores a batch of events
+  - contract (examples):
+    - `public function storeEvents(string $sourceName, Event[] $events): void` — stores the provided events; if the method returns without throwing, the events are considered durably persisted.
+    - `public function fetchLastSourceEventId(string $sourceName): ?int` — returns the highest `sourceEventId` persisted for the given source, or `null` if none exist. This method provides the authoritative checkpoint used by the loader before performing a remote fetch.
 - `EventSourceRegistryInterface`
   - provides the list of configured sources and their order for round-robin processing
 - `SourceCursorStoreInterface`
-  - reads and writes the last successfully stored event ID per source
+  - reads and writes the last successfully stored `sourceEventId` per source
 - `SourceLeaseManagerInterface`
   - acquires distributed processing rights for a source and enforces the 200 ms interval
- - advisory hints (for example, an observed `lastEventId`) MUST be stored in `source:{name}` metadata or validated against persistent storage; the lease itself is authoritative only for ownership and TTL semantics and MUST NOT embed authoritative checkpoint values.
+ - advisory hints (for example, an observed `lastStoredSourceEventId`) MUST be stored in `source:{name}` metadata or validated against persistent storage; the lease itself is authoritative only for ownership and TTL semantics and MUST NOT embed authoritative checkpoint values.
 - `EventLoaderInterface`
   - starts the main loop or a single loader iteration
 - `ClockInterface`
@@ -203,7 +209,7 @@ The task requirements effectively require a centralized coordination mechanism p
 Minimum recommendation:
 
 - for each source, there is a distributed state record containing at least:
-  - the last successfully stored `lastStoredEventId`
+  - the last successfully stored `lastStoredSourceEventId`
   - the point in time when the next request to that source is allowed
   - information that the source is currently leased by one loader instance
 
@@ -223,13 +229,13 @@ Concrete Redis pattern (decided):
 
 - Coordination store: **Redis** is the chosen coordination store for the reference implementation.
 - Key patterns:
-  - `source:{name}` — per-source metadata hash with fields: `nextCallAfter` (unix‑ms), `lastEventId` (advisory).
+  - `source:{name}` — per-source metadata hash with fields: `nextCallAfter` (unix‑ms), `lastStoredSourceEventId` (advisory).
   - `lock:{name}` — per-source lease key holding minimal information: `owner_id` (owner token) and `acquired_at` (unix‑ms). Acquire with atomic `SET NX PX` semantics.
 - Semantics:
   - Acquire `lock:{name}` using `SET NX PX <ttl_ms>`; `ttl_ms` derived from `max_call_duration_ms` with a safety margin. While TTL should be large enough to cover a normal fetch+store cycle, loaders MUST explicitly release `lock:{name}` (delete the key) immediately after successfully updating the checkpoint and related metadata — TTL is only a safety fallback for crash scenarios.
   - While holding the lock the loader may read/write `source:{name}` as optimization hints, but must always read the authoritative checkpoint from persistent storage before fetching.
   - If `nextCallAfter` (from `source:{name}`) indicates the source is not yet allowed, the holder may either wait while renewing the lease or release and skip; prefer skipping and letting round‑robin revisit later to avoid long-held locks.
-  - Release the lock by deleting `lock:{name}` or let TTL expire. During normal operation, locks should be deleted when done so next loader can take over. As saifty, lock will expire after TTL.
+  - Release the lock by deleting `lock:{name}` or let TTL expire. During normal operation, locks should be deleted when done so the next loader can take over. As safety, the lock will expire after TTL.
 
 These changes resolve question P1 by mandating Redis for per‑source coordination in the reference design.
 
@@ -237,7 +243,7 @@ Per-source metadata + per-source lock (selected approach)
 
 - Assumption: the number of sources is moderate and source definitions are relatively stable compared with locks. Each source is represented in Redis (or an equivalent coordination store) as `source:{name}` with fields such as:
   - `nextCallAfter` (unix-ms timestamp when the next request for this source is allowed)
-  - `lastEventId` (advisory last observed event id)
+  - `lastStoredSourceEventId` (advisory last observed sourceEventId)
 
 - Each source also has a per-source lease key `lock:{name}`. A loader that successfully acquires `lock:{name}` becomes the owner and is authorized to modify `source:{name}`.
 
@@ -245,9 +251,9 @@ Per-source metadata + per-source lock (selected approach)
   1. Iterate the local ordered list of sources in round‑robin order.
   2. For each candidate source attempt to acquire `lock:{name}` (atomic `SET NX PX ownerToken` or equivalent).
   3. If the lock is not acquired, skip the source and continue.
-  4. If the lock is acquired, read `source:{name}` (note: its values are advisory) and then read the authoritative last-stored event ID from persistent storage; use the DB value as the source-of-truth `lastEventId` before making the remote fetch.
+  4. If the lock is acquired, read `source:{name}` (note: its values are advisory) and then read the authoritative last-stored `sourceEventId` from persistent storage; use the DB value as the source-of-truth `lastStoredSourceEventId` before making the remote fetch.
   5. If `nextCallAfter` (or `nextAllowedAt`) indicates the call window has not yet opened, wait (or sleep until allowed) while holding or renewing the lease as needed.
-  6. Make the remote fetch using the authoritative `lastEventId`, store events, then update `source:{name}.nextCallAfter` (e.g. `now + throttle_ms`), `source:{name}.lastEventId`, and set the next allowed time (enforcing the `throttle_ms` global throttle). Release the lock (or let the TTL expire) and continue.
+  6. Make the remote fetch using the authoritative `lastStoredSourceEventId`, store events, then update `source:{name}.nextCallAfter` (e.g. `now + throttle_ms`), `source:{name}.lastStoredSourceEventId`, and set the next allowed time (enforcing the `throttle_ms` global throttle). Release the lock (or let the TTL expire) and continue.
 
 - Notes:
   - `lock:{name}` is the coordination primitive enforcing exclusivity and throttle; `source:{name}` is metadata and an optimization hint. Always validate against persistent storage before fetching.
@@ -269,8 +275,8 @@ One iteration over a single source should look like this:
 2. Attempt to acquire a lease for that source.
 3. If the lease is not available or 200 ms have not yet passed, skip the source.
 4. Read the current checkpoint for the source.
-4a. Verify checkpoint against storage: after acquiring the lease and reading the lease/checkpoint value for the source, read the authoritative last-stored event ID from persistent storage (for example: `SELECT id FROM events WHERE source = ? ORDER BY id DESC LIMIT 1`) and use that DB value as the source-of-truth `lastEventId` for the upcoming fetch. If the DB value is greater than the lease/checkpoint value, start from the DB value. If it is unexpectedly smaller, log a warning and use the DB value as the authoritative start point.
-5. Call the remote source with `lastEventId`.
+4a. Verify checkpoint against storage: after acquiring the lease and reading the lease/checkpoint value for the source, call `EventStorageInterface::fetchLastSourceEventId(sourceName)` (or equivalent authoritative query) to obtain the authoritative last-stored `sourceEventId` and use that DB value as the source-of-truth `lastStoredSourceEventId` for the upcoming fetch. If the DB value is greater than the lease/checkpoint value, start from the DB value. If it is unexpectedly smaller, log a warning and use the DB value as the authoritative start point.
+5. Call the remote source with `lastStoredSourceEventId`.
 6. If the call fails, log the error and release the lease.
 7. If a batch of events is returned, store it in the storage layer.
 8. After successful storage, update the checkpoint to the last stored event ID.
@@ -301,6 +307,7 @@ Below is the list of questions that should reasonably be clarified before implem
 ### P1 Which mechanism may we use for distributed coordination?
 
 The task says "Any", but for the actual specification we should confirm the preferred choice:
+
 ### P1 Distributed coordination (resolved)
 
 Resolved for the reference implementation: **Redis** with per‑source metadata (`source:{name}`) and per‑source lease keys (`lock:{name}`) as described in Section 8.2. This choice affects interface expectations and atomicity semantics (see 8.2 for key patterns and lease semantics).
@@ -312,18 +319,24 @@ The text says "during the system's operation", which suggests a strict interpret
 - never re-fetch an event that was already transferred over the network once, even after an instance restart
 - or only avoid conflicts between parallel instances during the same operating period
 
-### P3 May we assume that storage is idempotent by `(sourceName, eventId)`?
+Decision: discussed different scenarios
+
+### P3 May we assume that storage is idempotent by `(sourceName, sourceEventId)`?
 
 Although the task says we do not need to implement storage, it is important to know whether the expectation is:
 
 - strictly exactly-once storage
 - or only exactly-once network retrieval, with potentially idempotent writes
 
+Decision: implementation level detail, we will assume yes
+
 ### P4 What exactly does round-robin mean in a distributed scenario?
 
 We should confirm whether it is enough for each instance to iterate through the source list locally in round-robin order, or whether one globally coordinated round-robin sequence is expected.
 
 Without that answer, there are multiple valid interpretations.
+
+Decision: local round-robin + global locking logic in Redis
 
 ### P5 How should a permanently unavailable source be treated?
 
@@ -333,9 +346,13 @@ The task says "skip it and log", but it is not clear whether:
 - a backoff should be introduced
 - there should be a maximum error log frequency
 
+Decision: out of scope
+
 ### P6 What behavior is acceptable if the process stops during batch handling?
 
 Example: events have been fetched, but the process crashes before storage or before checkpoint update. We should confirm whether it is acceptable for the coordination lease to expire and for another instance to later repeat the same attempt, or whether stricter semantics are expected.
+
+Decision: assume it is acceptable to fetch events again
 
 ### P7 Should we define a minimal observability set in the first version?
 
@@ -347,6 +364,8 @@ For example:
 
 The task does not require this, but it is useful for operating the system.
 
+Decision: out of scope
+
 ### P8 Should dynamic addition and removal of sources be supported?
 
 The task assumes multiple sources, but does not say whether they are:
@@ -354,16 +373,20 @@ The task assumes multiple sources, but does not say whether they are:
 - statically configured at process startup
 - or allowed to change during runtime
 
+Decision: out of scope
+
 ### P9 What should we state in the specification about performance and payload size?
 
 Although optimization is not the priority, it is useful to confirm whether large event payloads are expected, because that affects whether a batch should be stored as a whole or streamed event by event.
+
+Decision: out of scope
 
 ## 11. Recommended initial assumptions if answers are not available
 
 If implementation needs to start before all questions are answered, the following initial assumptions should be documented:
 
 - distributed coordination uses a central persistent store with atomic updates
-- a conflict is defined as any repeated network retrieval of the same `(sourceName, eventId)`
+- a conflict is defined as any repeated network retrieval of the same `(sourceName, sourceEventId)`
 - storage is considered reliable and sufficiently idempotent for the expected execution model
 - round-robin is deterministic locally per instance, while exclusivity is enforced through a per-source lease mechanism
 - on source failure, the loader logs the incident and continues without crashing the process
