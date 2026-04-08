@@ -317,6 +317,17 @@ Per-source metadata + per-source lock (selected approach)
   - `lock:{name}` is the coordination primitive enforcing exclusivity and throttle; `source:{name}` is metadata and an optimization hint. Always validate against persistent storage before fetching.
   - Choose TTLs and renewal behavior so that locks do not block progress if a loader crashes; prefer letting TTL expire rather than force-deleting locks.
 
+### Startup bootstrap: global sources lock
+
+- Key: `lock:sources` — a global bootstrap lease acquired via `SET NX PX <ttl_ms>` used to avoid races when populating `source:{name}` entries on startup or during registry refresh.
+- On process start (or when explicitly refreshing the registry), each loader SHOULD attempt to acquire `lock:sources`.
+- The loader that acquires `lock:sources` MUST:
+  - call `EventSourceRegistryInterface::getSources()` to obtain the JSON-serializable map of sources;
+  - for each entry in that map, write the provided JSON value to `source:{name}` in Redis (overwriting is acceptable; adapters MAY choose create-if-missing semantics);
+  - release `lock:sources` immediately after persisting the entries by deleting the key. The TTL is only a safety fallback if the process crashes.
+- If a loader fails to acquire `lock:sources`, it MUST NOT attempt to write the global source list; it should continue startup using local configuration and/or wait and retry according to implementation policy (this retry behavior is out of scope for the reference loader).
+- Operational notes: choose a modest, configurable TTL (suggested default: 30000 ms). Ensure bootstrap writes are idempotent so repeated or concurrent attempts do not change semantics.
+
 Configuration assumptions
 
 - The loader must expose configuration parameters that control timing behavior. In particular:
