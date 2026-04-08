@@ -48,6 +48,7 @@ In scope:
 - an interface or service for progress coordination and per-source locking
 - the main event loader running in an infinite loop
 - a basic error-handling strategy and retry behavior at the loop level
+ - a basic error-handling strategy: log failing sources and skip them in the current iteration (no automatic retry/backoff is required by the reference implementation)
 - the ability to test the loader with mocks and stubs
 
 - a minimal PHP/Symfony project skeleton (Composer manifest, PSR-4 autoloading), an `EventLoader` implemented as a Symfony service and/or console command, and a `README.md` with run instructions.
@@ -200,6 +201,56 @@ At minimum, the following set of abstractions is recommended:
 
 Implementation note: these abstractions will be defined as PHP `interface`s and modeled as Symfony services in the reference implementation. The reference implementation MUST provide only the PHP `interface` definitions and Symfony wiring (service configuration); concrete infra adapters/clients (HTTP, gRPC, queue clients) and storage backends are explicitly OUT OF SCOPE for the first version and do not need to be implemented. Use Composer for dependency management and PSR‑4 autoloading.
 
+8.1.1 Interface method signatures (recommended)
+
+To remove ambiguity and make the reference implementation straightforward, the following example method signatures are recommended for the interfaces above. These are descriptive contracts (not language‑specific code), and the exact names may be adjusted in the implementation as long as semantics are preserved.
+
+- `EventSourceClientInterface`
+  - `fetch(string $sourceName, int $afterSourceEventId, int $limit = 1000): Event[]`
+
+- `EventStorageInterface`
+  - `storeEvents(string $sourceName, Event[] $events): void` — persist the batch atomically for the call.
+  - `fetchLastSourceEventId(string $sourceName): ?int` — return the largest persisted `sourceEventId` for the source or `null` if none.
+
+- `EventSourceRegistryInterface`
+  - `getSources(): array` — return a map/object where keys are `sourceName` and values are JSON-serializable objects representing the per-source metadata. Each value MUST be suitable for direct storage as the Redis value of `source:{name}` (i.e., the loader can `json_encode()` the value and write it to `source:{name}` without further transformation). The loader will iterate the map keys in round‑robin order.
+
+- `SourceCursorStoreInterface`
+  - `getLastStoredSourceEventId(string $sourceName): ?int`
+  - `setLastStoredSourceEventId(string $sourceName, int $sourceEventId): void`
+
+- `SourceLeaseManagerInterface`
+  - `tryAcquireLease(string $sourceName, string $ownerId, int $ttlMs): bool` — attempt to acquire lease; returns true if successful.
+  - `renewLease(string $sourceName, string $ownerId, int $ttlMs): bool` — renew an existing lease held by `ownerId`.
+  - `releaseLease(string $sourceName, string $ownerId): void` — release the lease if owned by `ownerId`.
+  - `getLeaseOwner(string $sourceName): ?string`
+
+- `EventLoaderInterface`
+  - `runLoop(): void` — start the infinite loop processing (blocking call); honor graceful shutdown.
+  - `runOnce(): void` — perform a single round of processing over all sources (useful for tests).
+  - `stop(): void` — request graceful shutdown (loader should finish current batch within timeout and exit).
+
+- `ClockInterface`
+  - `now(): int` — return unix‑ms timestamp (used for testing and scheduling).
+
+- `LoggerInterface`
+  - typical `info(string $msg, array $ctx = [])`, `warn(...)`, `error(...)` semantics (PSR‑3 compatible recommended).
+
+8.1.2 Exceptions and error semantics
+
+Define a small set of domain exceptions so calling code (the loader) can decide retries vs. skips:
+
+- `TransientEventSourceException` — transient failure fetching from a source (network timeout, 5xx). Loader MAY retry according to retry policy.
+ - `TransientEventSourceException` — transient failure fetching from a source (network timeout, 5xx). The reference loader SHOULD log the incident and skip the source for the current iteration; automatic retry/backoff is out of scope and not required.
+ - `PermanentEventSourceException` — permanent failure (4xx unrecoverable); loader MUST log and skip source for this iteration.
+ - `EventStorageException` — permanent storage failure; considered critical (loader should log and may abort depending on policy).
+ - `TransientStorageException` — temporary storage problem; the reference loader SHOULD log and skip (automatic retry is out of scope).
+- `LeaseAcquireException` / `LeaseReleaseException` — problems interacting with coordination store; loader should log and skip/continue accordingly.
+
+Implementations should map lower‑level client/library exceptions to these domain exceptions at the adapter boundary.
+
+Implementation note: these abstractions will be defined as PHP `interface`s and modeled as Symfony services in the reference implementation. The reference implementation MUST provide only the PHP `interface` definitions and Symfony wiring (service configuration); concrete infra adapters/clients (HTTP, gRPC, queue clients) and storage backends are explicitly OUT OF SCOPE for the first version and do not need to be implemented. Use Composer for dependency management and PSR‑4 autoloading.
+
  The loader will perform exactly one fetch operation per acquired lease.
 
 ### 8.2 Coordination mechanism
@@ -229,7 +280,13 @@ Concrete Redis pattern (decided):
 
 - Coordination store: **Redis** is the chosen coordination store for the reference implementation.
 - Key patterns:
-  - `source:{name}` — per-source metadata hash with fields: `nextCallAfter` (unix‑ms), `lastStoredSourceEventId` (advisory).
+  - `source:{name}` — per-source metadata hash with fields: `nextCallAfter` (unix‑ms), `lastStoredSourceEventId` (advisory). The reference implementation expects that `EventSourceRegistryInterface::getSources()` provides values that are directly JSON-serializable into this key (i.e., the registry value may be `json_encode()`d and stored as the value of `source:{name}` without transformation). Example shape:
+
+    {
+      "nextCallAfter": 1712678400000,
+      "lastStoredSourceEventId": 12345,
+      "description": "Optional human-friendly text"
+    }
   - `lock:{name}` — per-source lease key holding minimal information: `owner_id` (owner token) and `acquired_at` (unix‑ms). Acquire with atomic `SET NX PX` semantics.
 - Semantics:
   - Acquire `lock:{name}` using `SET NX PX <ttl_ms>`; `ttl_ms` derived from `max_call_duration_ms` with a safety margin. While TTL should be large enough to cover a normal fetch+store cycle, loaders MUST explicitly release `lock:{name}` (delete the key) immediately after successfully updating the checkpoint and related metadata — TTL is only a safety fallback for crash scenarios.
@@ -252,6 +309,7 @@ Per-source metadata + per-source lock (selected approach)
   2. For each candidate source attempt to acquire `lock:{name}` (atomic `SET NX PX ownerToken` or equivalent).
   3. If the lock is not acquired, skip the source and continue.
   4. If the lock is acquired, read `source:{name}` (note: its values are advisory) and then read the authoritative last-stored `sourceEventId` from persistent storage; use the DB value as the source-of-truth `lastStoredSourceEventId` before making the remote fetch.
+ 4.5. The loader MUST read any per-source metadata from the value returned by `getSources()` (the per-source JSON object) and may write updated metadata back to `source:{name}` by serializing that object. This keeps the registry authoritative for initial per-source configuration while allowing runtime metadata updates to be persisted.
   5. If `nextCallAfter` (or `nextAllowedAt`) indicates the call window has not yet opened, wait (or sleep until allowed) while holding or renewing the lease as needed.
   6. Make the remote fetch using the authoritative `lastStoredSourceEventId`, store events, then update `source:{name}.nextCallAfter` (e.g. `now + throttle_ms`), `source:{name}.lastStoredSourceEventId`, and set the next allowed time (enforcing the `throttle_ms` global throttle). Release the lock (or let the TTL expire) and continue.
 
@@ -294,7 +352,7 @@ These decisions are not fully determined by the task text and should be confirme
 - where the distributed coordination state will be stored: SQL database, Redis, or another locking/store mechanism
  - where the distributed coordination state will be stored: Resolved — Redis chosen for the reference implementation (see 8.2)
 - whether round-robin order must be strictly deterministic globally, or whether it is sufficient for each instance to iterate locally over the same list of sources
-- what exactly "skip source" means on failure: immediately continue to the next source without backoff, or introduce a minimal per-source backoff
+- what exactly "skip source" means on failure: Resolved — the reference implementation will **log and skip immediately**; no per-source backoff or retry/backoff is required in the loader. Implementations MAY add backoff if desired, but the reference loader must not implement it.
 - whether the loader should support graceful shutdown
 - whether logging should be purely technical or include domain-specific error codes
 - whether the specification should explicitly state that the 1000-event batch limit is only a retrieval contract and must not be interpreted as a throughput or scaling target
@@ -340,13 +398,7 @@ Decision: local round-robin + global locking logic in Redis
 
 ### P5 How should a permanently unavailable source be treated?
 
-The task says "skip it and log", but it is not clear whether:
-
-- it should be retried again in the very next cycle
-- a backoff should be introduced
-- there should be a maximum error log frequency
-
-Decision: out of scope
+The task says "skip it and log". Resolved for the reference implementation: **log and skip immediately**. The loader MUST not implement per-source retry/backoff — it should continue to the next source in the same cycle. Implementations MAY introduce backoff or rate-limiting outside the reference loader, but that behavior is explicitly out of scope for the reference implementation.
 
 ### P6 What behavior is acceptable if the process stops during batch handling?
 
