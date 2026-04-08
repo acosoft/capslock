@@ -206,6 +206,38 @@ Before making a network call, one instance must atomically:
 
 Without such atomic coordination, it is not possible to satisfy the requirement that the same event is never transferred over the network more than once.
 
+Recommended lease implementation
+
+We recommend using Redis for per-source leases. Redis provides native TTL semantics, low-latency atomic primitives (e.g. `SET NX PX`) and well-known patterns for short-lived leases and expiries — properties that match the task requirement for globally enforced, time-bounded per-source leasing. Store one key per source (for example `lock:{sourceName}`) with fields for `owner_id`, `hintLastEventId` (advisory), `nextAllowedAt` (for the 200 ms throttle) and set a TTL larger than the expected fetch+store window. Treat the lock as authoritative only for ownership and throttling; always validate the authoritative last-stored event ID from persistent storage before making the remote fetch. Redis adds operational complexity versus a single SQL row, but its expiry/TTL semantics and low latency make it the preferred choice for short-lived coordination in this design.
+
+Per-source metadata + per-source lock (selected approach)
+
+- Assumption: the number of sources is moderate and source definitions are relatively stable compared with locks. Each source is represented in Redis (or an equivalent coordination store) as `source:{name}` with fields such as:
+  - `nextCallAfter` (unix-ms timestamp when the next request for this source is allowed)
+  - `lastEventId` (advisory last observed event id)
+
+- Each source also has a per-source lease key `lock:{name}`. A loader that successfully acquires `lock:{name}` becomes the owner and is authorized to modify `source:{name}`.
+
+- Loader behavior (round‑robin + per‑source lock):
+  1. Iterate the local ordered list of sources in round‑robin order.
+  2. For each candidate source attempt to acquire `lock:{name}` (atomic `SET NX PX ownerToken` or equivalent).
+  3. If the lock is not acquired, skip the source and continue.
+  4. If the lock is acquired, read `source:{name}` (note: its values are advisory) and then read the authoritative last-stored event ID from persistent storage; use the DB value as the source-of-truth `lastEventId` before making the remote fetch.
+  5. If `nextCallAfter` (or `nextAllowedAt`) indicates the call window has not yet opened, wait (or sleep until allowed) while holding or renewing the lease as needed.
+  6. Make the remote fetch using the authoritative `lastEventId`, store events, then update `source:{name}.nextCallAfter` (e.g. `now + throttle_ms`), `source:{name}.lastEventId`, and set the next allowed time (enforcing the `throttle_ms` global throttle). Release the lock (or let the TTL expire) and continue.
+
+- Notes:
+  - `lock:{name}` is the coordination primitive enforcing exclusivity and throttle; `source:{name}` is metadata and an optimization hint. Always validate against persistent storage before fetching.
+  - Choose TTLs and renewal behavior so that locks do not block progress if a loader crashes; prefer letting TTL expire rather than force-deleting locks.
+
+Configuration assumptions
+
+- The loader must expose configuration parameters that control timing behavior. In particular:
+  - `max_call_duration_ms` — the maximum time the loader expects a single remote fetch+store cycle to take (default: 5 minutes). Lock TTLs should be derived from this parameter with a safety margin.
+  - `throttle_ms` — the per-source global throttle interval (default: 200 ms).
+
+- These parameters are provided at the loader level (instance config). The spec notes that these could instead be stored as global configuration in a central store, but that would increase operational complexity (coordination, updates, and versioning) and is left as an optional extension. The implementation will treat the loader-level config as authoritative for TTL and throttle decisions.
+
 ### 8.3 Minimum loader flow
 
 One iteration over a single source should look like this:
