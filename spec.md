@@ -184,7 +184,7 @@ At minimum, the following set of abstractions is recommended:
   - reads and writes the last successfully stored event ID per source
 - `SourceLeaseManagerInterface`
   - acquires distributed processing rights for a source and enforces the 200 ms interval
- - may include an advisory `hintLastEventId` in the lease; this is a hint and must be validated against storage before performing a fetch
+ - advisory hints (for example, an observed `lastEventId`) MUST be stored in `source:{name}` metadata or validated against persistent storage; the lease itself is authoritative only for ownership and TTL semantics and MUST NOT embed authoritative checkpoint values.
 - `EventLoaderInterface`
   - starts the main loop or a single loader iteration
 - `ClockInterface`
@@ -217,7 +217,21 @@ Without such atomic coordination, it is not possible to satisfy the requirement 
 
 Recommended lease implementation
 
-We recommend using Redis for per-source leases. Redis provides native TTL semantics, low-latency atomic primitives (e.g. `SET NX PX`) and well-known patterns for short-lived leases and expiries — properties that match the task requirement for globally enforced, time-bounded per-source leasing. Store one key per source (for example `lock:{sourceName}`) with fields for `owner_id`, `hintLastEventId` (advisory), `nextAllowedAt` (for the 200 ms throttle) and set a TTL larger than the expected fetch+store window. Treat the lock as authoritative only for ownership and throttling; always validate the authoritative last-stored event ID from persistent storage before making the remote fetch. Redis adds operational complexity versus a single SQL row, but its expiry/TTL semantics and low latency make it the preferred choice for short-lived coordination in this design.
+We recommend using Redis for per-source leases. Redis provides native TTL semantics, low-latency atomic primitives (e.g. `SET NX PX`) and well-known patterns for short-lived leases and expiries — properties that match the task requirement for globally enforced, time-bounded per-source leasing. Store one key per source (for example `lock:{sourceName}`) containing the owner token and acquisition timestamp; choose a TTL larger than the expected fetch+store window as a safety margin. Treat the lock as authoritative only for ownership and throttling; always validate the authoritative last-stored event ID from persistent storage before making the remote fetch. Redis adds operational complexity versus a single SQL row, but its expiry/TTL semantics and low latency make it the preferred choice for short-lived coordination in this design.
+
+Concrete Redis pattern (decided):
+
+- Coordination store: **Redis** is the chosen coordination store for the reference implementation.
+- Key patterns:
+  - `source:{name}` — per-source metadata hash with fields: `nextCallAfter` (unix‑ms), `lastEventId` (advisory).
+  - `lock:{name}` — per-source lease key holding minimal information: `owner_id` (owner token) and `acquired_at` (unix‑ms). Acquire with atomic `SET NX PX` semantics.
+- Semantics:
+  - Acquire `lock:{name}` using `SET NX PX <ttl_ms>`; `ttl_ms` derived from `max_call_duration_ms` with a safety margin. While TTL should be large enough to cover a normal fetch+store cycle, loaders MUST explicitly release `lock:{name}` (delete the key) immediately after successfully updating the checkpoint and related metadata — TTL is only a safety fallback for crash scenarios.
+  - While holding the lock the loader may read/write `source:{name}` as optimization hints, but must always read the authoritative checkpoint from persistent storage before fetching.
+  - If `nextCallAfter` (from `source:{name}`) indicates the source is not yet allowed, the holder may either wait while renewing the lease or release and skip; prefer skipping and letting round‑robin revisit later to avoid long-held locks.
+  - Release the lock by deleting `lock:{name}` or let TTL expire. During normal operation, locks should be deleted when done so next loader can take over. As saifty, lock will expire after TTL.
+
+These changes resolve question P1 by mandating Redis for per‑source coordination in the reference design.
 
 Per-source metadata + per-source lock (selected approach)
 
@@ -261,7 +275,7 @@ One iteration over a single source should look like this:
 7. If a batch of events is returned, store it in the storage layer.
 8. After successful storage, update the checkpoint to the last stored event ID.
 9. Record the new point in time from which the next request is allowed.
-10. Release the lease and continue.
+10. Release the lease and continue. The loader MUST explicitly release the lease by deleting the `lock:{name}` key immediately after updating the checkpoint and related metadata; it must not rely on the TTL to free the lock during normal operation.
 
 ### Lease timeouts and operational assumption
 
@@ -272,6 +286,7 @@ Operational assumption: duplicate network retrievals remain possible in crash-an
 These decisions are not fully determined by the task text and should be confirmed before implementation:
 
 - where the distributed coordination state will be stored: SQL database, Redis, or another locking/store mechanism
+ - where the distributed coordination state will be stored: Resolved — Redis chosen for the reference implementation (see 8.2)
 - whether round-robin order must be strictly deterministic globally, or whether it is sufficient for each instance to iterate locally over the same list of sources
 - what exactly "skip source" means on failure: immediately continue to the next source without backoff, or introduce a minimal per-source backoff
 - whether the loader should support graceful shutdown
@@ -286,12 +301,9 @@ Below is the list of questions that should reasonably be clarified before implem
 ### P1 Which mechanism may we use for distributed coordination?
 
 The task says "Any", but for the actual specification we should confirm the preferred choice:
+### P1 Distributed coordination (resolved)
 
-- an SQL table with row-level locking
-- Redis with lease/lock records
-- something else
-
-This directly affects interface design and atomicity semantics.
+Resolved for the reference implementation: **Redis** with per‑source metadata (`source:{name}`) and per‑source lease keys (`lock:{name}`) as described in Section 8.2. This choice affects interface expectations and atomicity semantics (see 8.2 for key patterns and lease semantics).
 
 ### P2 Must the no-duplicate-retrieval rule apply for the entire lifetime of the system, or only during concurrent loader execution?
 
