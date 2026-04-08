@@ -179,6 +179,7 @@ At minimum, the following set of abstractions is recommended:
   - reads and writes the last successfully stored event ID per source
 - `SourceLeaseManagerInterface`
   - acquires distributed processing rights for a source and enforces the 200 ms interval
+ - may include an advisory `hintLastEventId` in the lease; this is a hint and must be validated against storage before performing a fetch
 - `EventLoaderInterface`
   - starts the main loop or a single loader iteration
 - `ClockInterface`
@@ -213,6 +214,7 @@ One iteration over a single source should look like this:
 2. Attempt to acquire a lease for that source.
 3. If the lease is not available or 200 ms have not yet passed, skip the source.
 4. Read the current checkpoint for the source.
+4a. Verify checkpoint against storage: after acquiring the lease and reading the lease/checkpoint value for the source, read the authoritative last-stored event ID from persistent storage (for example: `SELECT id FROM events WHERE source = ? ORDER BY id DESC LIMIT 1`) and use that DB value as the source-of-truth `lastEventId` for the upcoming fetch. If the DB value is greater than the lease/checkpoint value, start from the DB value. If it is unexpectedly smaller, log a warning and use the DB value as the authoritative start point.
 5. Call the remote source with `lastEventId`.
 6. If the call fails, log the error and release the lease.
 7. If a batch of events is returned, store it in the storage layer.
