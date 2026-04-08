@@ -54,7 +54,8 @@ Out of scope:
 - a concrete HTTP/gRPC/queue client implementation
 - an administrative interface
 - a monitoring dashboard
-- horizontal scaling beyond the minimum required coordination
+- throughput-oriented scaling beyond the minimum required distributed coordination
+- backlog-draining optimizations, prefetching, batching strategies beyond the source contract, or other performance tuning not required to satisfy the task
 - optimizations that are not necessary to satisfy the task
 
 ## 5. Domain model
@@ -76,6 +77,7 @@ For the purposes of the core, it is sufficient to assume:
 - `eventId` is unique within a source
 - `eventId` grows monotonically over time
 - an event payload exists, but the loader core does not need to know its internal format
+- events are immutable, which reduces the business risk of duplicate processing at the storage level; however, immutability does not remove the coordination requirement to avoid duplicate network retrieval.
 
 ### 5.3 Loader Instance
 
@@ -111,6 +113,7 @@ There must be at least a 200 ms interval between any two consecutive requests to
 ### FR-6 No duplicate network retrieval
 
 The same event from the same source must not be transferred over the network more than once during system operation. This is the key integrity requirement.
+See Section 8.3 for crash/recovery limitations and mitigation; duplicate retrievals must be minimized during normal operation.
 
 ### FR-7 Event storage
 
@@ -141,6 +144,10 @@ The solution must be feasible for multiple instances running on different server
 ### NFR-2 Minimal complexity
 
 The simplest mechanism that satisfies the task requirements should be preferred.
+
+### NFR-2a Throughput is not a design goal
+
+The fact that a source may return up to 1000 events per request must be treated as a source API constraint, not as a requirement to optimize for high throughput or large backlog processing. Design choices should prioritize correctness and minimal complexity over performance optimization.
 
 ### NFR-3 Protocol independence
 
@@ -213,6 +220,10 @@ One iteration over a single source should look like this:
 9. Record the new point in time from which the next request is allowed.
 10. Release the lease and continue.
 
+### Lease timeouts and operational assumption
+
+Operational assumption: duplicate network retrievals remain possible in crash-and-recovery windows (for example, after a loader fetches events but crashes before checkpointing). The design therefore treats duplicate prevention as a primary goal during normal concurrent operation, while acknowledging that rare duplicates may still occur. Implementation will include pragmatic checks, sensible lease TTLs, and bounded fetch/store timeouts to minimize such duplicates as much as reasonably possible.
+
 ## 9. Main product and technical decisions to confirm
 
 These decisions are not fully determined by the task text and should be confirmed before implementation:
@@ -222,6 +233,8 @@ These decisions are not fully determined by the task text and should be confirme
 - what exactly "skip source" means on failure: immediately continue to the next source without backoff, or introduce a minimal per-source backoff
 - whether the loader should support graceful shutdown
 - whether logging should be purely technical or include domain-specific error codes
+- whether the specification should explicitly state that the 1000-event batch limit is only a retrieval contract and must not be interpreted as a throughput or scaling target
+
 
 ## 10. Open questions for clarification
 
