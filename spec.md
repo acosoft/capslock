@@ -36,6 +36,8 @@ The first version should provide:
 - tolerance to remote source failures so the whole process does not crash
 - logging of source unavailability or request failures
 
+- Implementation target: PHP 8.1; the reference implementation MUST use the Symfony framework (console command + services).
+
 ## 4. Scope of the first version
 
 In scope:
@@ -47,6 +49,8 @@ In scope:
 - the main event loader running in an infinite loop
 - a basic error-handling strategy and retry behavior at the loop level
 - the ability to test the loader with mocks and stubs
+
+- a minimal PHP/Symfony project skeleton (Composer manifest, PSR-4 autoloading), an `EventLoader` implemented as a Symfony service and/or console command, and a `README.md` with run instructions.
 
 Out of scope:
 
@@ -186,6 +190,8 @@ At minimum, the following set of abstractions is recommended:
   - abstracts time for testing throttling logic
 - `LoggerInterface`
   - logs errors and source unavailability
+
+Implementation note: these abstractions will be defined as PHP `interface`s and modeled as Symfony services in the reference implementation. Implementations (clients, storage, lease manager) should be registered in the Symfony service container and wired via dependency injection. Use Composer for dependency management and PSR‑4 autoloading.
 
 ### 8.2 Coordination mechanism
 
@@ -347,6 +353,8 @@ If implementation needs to start before all questions are answered, the followin
 - round-robin is deterministic locally per instance, while exclusivity is enforced through a per-source lease mechanism
 - on source failure, the loader logs the incident and continues without crashing the process
 - the checkpoint advances only after successful batch storage
+
+- Repository deliverables: include a `composer.json` targeting PHP >= 8.1, a minimal Symfony project skeleton or instructions to scaffold it, PSR‑4 autoloading, an example Symfony console command to start the loader, and a `README.md` with run/test instructions.
 
 ## 12. Recommended next step
 
