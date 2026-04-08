@@ -1,0 +1,40 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use Symfony\Component\Console\Application;
+
+$application = new Application('Event Loader', '0.1.0');
+
+// Bootstrap minimal test doubles and register the EventLoaderCommand so `app:event-loader` works
+// without a full Symfony kernel.
+try {
+    // create simple implementations for local testing
+    $logger = new \App\Logger\StdoutLogger();
+    $registry = new \App\TestDoubles\InMemoryEventSourceRegistry();
+    // use random event source client for testing
+    $client = new \App\TestDoubles\RandomEventSourceClient();
+    $storage = new \App\TestDoubles\InMemoryEventStorage();
+    $cursor = new \App\TestDoubles\InMemorySourceCursorStore();
+    $lease = new \App\TestDoubles\InMemorySourceLeaseManager();
+    $clock = new \App\TestDoubles\SystemClock();
+
+    $loader = new \App\Service\EventLoader(
+        $registry,
+        $client,
+        $storage,
+        $cursor,
+        $lease,
+        $clock,
+        $logger
+    );
+
+    $application->add(new \App\Command\EventLoaderCommand($loader));
+
+    $application->run();
+} catch (Throwable $e) {
+    fwrite(STDERR, $e->getMessage() . PHP_EOL);
+    exit(1);
+}

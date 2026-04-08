@@ -1,0 +1,16 @@
+services:
+  _defaults:
+    autowire: true
+    autoconfigure: true
+    public: false
+
+  App\\:
+    resource: '../src/*'
+    exclude: '../src/{DependencyInjection,Entity,Tests,Kernel.php}'
+
+  App\Command\EventLoaderCommand:
+    public: true
+    tags: ['console.command']
+  App\Logger\StdoutLogger: ~
+
+  Psr\Log\LoggerInterface: '@App\\Logger\\StdoutLogger'
