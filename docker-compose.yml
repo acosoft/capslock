@@ -12,7 +12,7 @@ services:
     restart: unless-stopped
     environment:
       - LOADER_NAME=L1
-      - THROTTLE_MS=200
+      - THROTTLE_MS=8000
       - MAX_CALL_DURATION_MS=300000
       - LOOP_SLEEP_US=5000000
     command: ["php", "bin/console", "app:event-loader"]
@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
     environment:
       - LOADER_NAME=L2
-      - THROTTLE_MS=200
+      - THROTTLE_MS=8000
       - MAX_CALL_DURATION_MS=300000
       - LOOP_SLEEP_US=5000000
     command: ["php", "bin/console", "app:event-loader"]
