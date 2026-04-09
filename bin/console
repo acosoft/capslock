@@ -35,36 +35,42 @@ try {
                 break;
             }
             if (is_array($existing) && count($existing) > 0) {
+                fwrite(STDOUT, "Bootstrap: found existing source:* keys, skipping bootstrap\n");
                 break; // already bootstrapped
             }
+            fwrite(STDOUT, "Bootstrap: no source:* keys found, attempting to acquire lock:sources\n");
             $ownerToken = 'bootstrap_' . bin2hex(random_bytes(6));
             $script = "local r = redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX') if r then return r else return nil end";
             $res = null;
             try {
                 $res = $predis->eval($script, 1, $bootstrapLockKey, $ownerToken, (string)$bootstrapTtlMs);
             } catch (Throwable $e) {
+                fwrite(STDOUT, "Bootstrap: eval failed when attempting lock acquisition: " . $e->getMessage() . "\n");
                 // failed to eval script - retry after sleep
             }
             if ($res !== null) {
+                fwrite(STDOUT, "Bootstrap: acquired lock:sources, writing source entries to Redis\n");
                 // acquired bootstrap lock - perform idempotent writes
                 try {
                     $sources = $registry->getSources();
                     foreach ($sources as $name => $meta) {
                         $predis->set('source:' . $name, json_encode($meta));
                     }
+                    fwrite(STDOUT, "Bootstrap: wrote " . count($sources) . " sources to Redis\n");
                 } catch (Throwable $e) {
                     fwrite(STDERR, "Bootstrap write failed: " . $e->getMessage() . PHP_EOL);
                 }
                 // release the bootstrap lock
                 try {
                     $predis->del($bootstrapLockKey);
+                    fwrite(STDOUT, "Bootstrap: released lock:sources\n");
                 } catch (Throwable $e) {
                     // ignore
                 }
                 break;
             }
             // failed to acquire lock, sleep 10s and retry per spec
-            fwrite(STDOUT, "Bootstrap lock unavailable; sleeping 10000ms before retrying\n");
+            fwrite(STDOUT, "Bootstrap: lock:sources unavailable; sleeping 10000ms before retrying\n");
             usleep(10000000);
         }
     } catch (\Throwable $e) {
