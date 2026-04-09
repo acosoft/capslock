@@ -321,6 +321,13 @@ Per-source metadata + per-source lock (selected approach)
 
 - Key: `lock:sources` — a global bootstrap lease acquired via `SET NX PX <ttl_ms>` used to avoid races when populating `source:{name}` entries on startup or during registry refresh.
 - On process start (or when explicitly refreshing the registry), each loader SHOULD attempt to acquire `lock:sources`.
+  
+ - Before attempting to acquire `lock:sources`, a loader MUST first check Redis for the existence of any keys matching the pattern `source:*`.
+   - If at least one `source:*` key exists, the loader MUST assume that the system has already been initialized and SHOULD NOT perform global bootstrap writes; it may proceed with normal processing.
+   - If no `source:*` keys exist, the loader SHOULD attempt to acquire the bootstrap lock `lock:sources` with TTL = 10000 ms (10 s) to perform initialization.
+     - If the loader obtains `lock:sources`, it MUST run the bootstrap: call `EventSourceRegistryInterface::getSources()`, write each entry idempotently to `source:{name}` in Redis, then release `lock:sources` and continue normal processing.
+     - If the loader fails to obtain `lock:sources`, it MUST NOT attempt to write the global source list; instead it SHOULD sleep for 10000 ms and then re-check for `source:*` keys and/or retry acquiring `lock:sources` according to the same logic. This avoids write races while ensuring loaders periodically re-check readiness.
+
 - The loader that acquires `lock:sources` MUST:
   - call `EventSourceRegistryInterface::getSources()` to obtain the JSON-serializable map of sources;
   - for each entry in that map, write the provided JSON value to `source:{name}` in Redis (overwriting is acceptable; adapters MAY choose create-if-missing semantics);
