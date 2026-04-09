@@ -54,7 +54,7 @@ try {
                 try {
                     $sources = $registry->getSources();
                     foreach ($sources as $name => $meta) {
-                        $predis->set('source:' . $name, json_encode($meta));
+                        $predis->set('source:' . $name, json_encode($meta, JSON_THROW_ON_ERROR));
                     }
                     fwrite(STDOUT, "Bootstrap: wrote " . count($sources) . " sources to Redis\n");
                 } catch (Throwable $e) {

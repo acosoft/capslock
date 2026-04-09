@@ -10,16 +10,23 @@ final class RedisSourceLeaseManager implements SourceLeaseManagerInterface
 {
     private PredisClient $client;
     private string $prefix;
+    private string $metadataPrefix;
 
-    public function __construct(PredisClient $client, string $prefix = 'lease:')
+    public function __construct(PredisClient $client, string $prefix = 'lock:', string $metadataPrefix = 'source:')
     {
         $this->client = $client;
         $this->prefix = $prefix;
+        $this->metadataPrefix = $metadataPrefix;
     }
 
     private function key(string $sourceName): string
     {
         return $this->prefix . $sourceName;
+    }
+
+    private function metadataKey(string $sourceName): string
+    {
+        return $this->metadataPrefix . $sourceName;
     }
 
     public function tryAcquireLease(string $sourceName, string $ownerId, int $ttlMs): bool
@@ -40,7 +47,7 @@ if redis.call('get', KEYS[1]) == ARGV[1] then
 end
 return 0
 LUA;
-        $res = $this->client->eval($script, 1, $key, $ownerId, $ttlMs);
+    $res = $this->client->eval($script, 1, $key, $ownerId, (string)$ttlMs);
         return (int)$res > 0;
     }
 
@@ -65,5 +72,32 @@ LUA;
         $key = $this->key($sourceName);
         $val = $this->client->get($key);
         return $val === null ? null : (string)$val;
+    }
+
+    public function getSourceMetadata(string $sourceName): ?array
+    {
+        $raw = $this->client->get($this->metadataKey($sourceName));
+        if ($raw === null) {
+            return null;
+        }
+
+        $decoded = json_decode((string)$raw, true);
+        return is_array($decoded) ? $decoded : null;
+    }
+
+    public function setNextCallAfter(string $sourceName, int $nextCallAfterUnixMs): void
+    {
+        $metadata = $this->getSourceMetadata($sourceName) ?? [];
+        $metadata['nextCallAfter'] = $nextCallAfterUnixMs;
+
+        $this->client->set($this->metadataKey($sourceName), json_encode($metadata, JSON_THROW_ON_ERROR));
+    }
+
+    public function setLastStoredSourceEventId(string $sourceName, int $sourceEventId): void
+    {
+        $metadata = $this->getSourceMetadata($sourceName) ?? [];
+        $metadata['lastStoredSourceEventId'] = $sourceEventId;
+
+        $this->client->set($this->metadataKey($sourceName), json_encode($metadata, JSON_THROW_ON_ERROR));
     }
 }

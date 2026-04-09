@@ -82,7 +82,7 @@ final class EventLoader implements EventLoaderInterface
     {
         $sources = $this->registry->getSources();
 
-        foreach ($sources as $sourceName => $meta) {
+        foreach ($sources as $sourceName => $sourceConfig) {
 
             usleep($this->loopSleepUs);
 
@@ -107,14 +107,49 @@ final class EventLoader implements EventLoaderInterface
                 usleep($this->loopSleepUs);
                 continue;
             }
-
-            $this->logger->info('lease acquired for source {source} owner {owner}', ['source' => $sourceName, 'owner' => $this->loaderName]);
-
             try {
+                $this->logger->info('lease acquired for source {source} owner {owner}', ['source' => $sourceName, 'owner' => $this->loaderName]);
+
                 // authoritative checkpoint from storage
                 $lastStored = $this->storage->fetchLastSourceEventId($sourceName) ?? -1;
 
+                // Read runtime metadata from coordination store (Redis) rather than trusting registry-provided meta
+                $coordMeta = null;
                 try {
+                    $coordMeta = $this->leaseManager->getSourceMetadata($sourceName);
+                } catch (\Throwable $t) {
+                    // If metadata read fails, log and continue using storage checkpoint
+                    $this->logger->warning('failed reading coordination metadata for source {source}: {err}', ['source' => $sourceName, 'err' => $t->getMessage()]);
+                }
+
+                if ($coordMeta === null && is_array($sourceConfig)) {
+                    $coordMeta = $sourceConfig;
+                }
+
+                if (is_array($coordMeta) && array_key_exists('lastStoredSourceEventId', $coordMeta)) {
+                    $advisoryLastStored = $coordMeta['lastStoredSourceEventId'];
+                    if ($advisoryLastStored !== null && (int)$advisoryLastStored !== $lastStored) {
+                        $this->logger->warning(
+                            'coordination metadata for source {source} is out of sync: advisory={advisory} authoritative={authoritative}',
+                            ['source' => $sourceName, 'advisory' => (int)$advisoryLastStored, 'authoritative' => $lastStored]
+                        );
+                    }
+                }
+
+                try {
+                    // Enforce per-source throttle based on shared coordination metadata.
+                    $now = $this->clock->now();
+                    $nextCallAfter = null;
+                    if (is_array($coordMeta) && array_key_exists('nextCallAfter', $coordMeta)) {
+                        $nextCallAfter = (int)$coordMeta['nextCallAfter'];
+                    }
+
+                    if ($nextCallAfter !== null && $now < $nextCallAfter) {
+                        $waitMs = $nextCallAfter - $now;
+                        $this->logger->info('throttle: skipping source {source} for another {ms}ms', ['ms' => $waitMs, 'source' => $sourceName]);
+                        continue;
+                    }
+
                     $this->logger->info('fetching events for source {source} after {after}', ['source' => $sourceName, 'after' => $lastStored]);
                     $startMs = $this->clock->now();
                     $events = $this->client->fetch($sourceName, $lastStored, 1000);
@@ -122,6 +157,12 @@ final class EventLoader implements EventLoaderInterface
                 } catch (TransientEventSourceException | PermanentEventSourceException $e) {
                     $this->logger->error('Source fetch failed for source {source}: {err}', ['source' => $sourceName, 'err' => $e->getMessage()]);
                     continue;
+                }
+
+                try {
+                    $this->leaseManager->setNextCallAfter($sourceName, $this->clock->now() + $this->throttleMs);
+                } catch (\Throwable $t) {
+                    $this->logger->warning('failed updating nextCallAfter for source {source}: {err}', ['source' => $sourceName, 'err' => $t->getMessage()]);
                 }
 
                 $count = count($events);
@@ -148,6 +189,12 @@ final class EventLoader implements EventLoaderInterface
                 if ($last instanceof \App\Model\Event) {
                     $this->cursorStore->setLastStoredSourceEventId($sourceName, $last->sourceEventId);
                     $this->logger->info('advanced cursor for source {source} to {id}', ['source' => $sourceName, 'id' => $last->sourceEventId]);
+
+                    try {
+                        $this->leaseManager->setLastStoredSourceEventId($sourceName, $last->sourceEventId);
+                    } catch (\Throwable $t) {
+                        $this->logger->warning('failed updating advisory last stored id for source {source}: {err}', ['source' => $sourceName, 'err' => $t->getMessage()]);
+                    }
                 }
             } finally {
                 try {
