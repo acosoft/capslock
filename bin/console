@@ -23,6 +23,50 @@ try {
     try {
         $predis = new \Predis\Client($redisDsn);
         $lease = new \App\Adapter\RedisSourceLeaseManager($predis);
+        // Startup bootstrap per spec.md: ensure `source:*` keys exist or perform idempotent bootstrap
+        $bootstrapLockKey = 'lock:sources';
+        $bootstrapTtlMs = 10000; // 10s
+        // If no source:* keys exist, try to acquire bootstrap lock and populate source:{name}
+        while (true) {
+            try {
+                $existing = $predis->keys('source:*');
+            } catch (Throwable $e) {
+                // if keys command fails, bail out of bootstrap and continue; loader requires Redis anyway
+                break;
+            }
+            if (is_array($existing) && count($existing) > 0) {
+                break; // already bootstrapped
+            }
+            $ownerToken = 'bootstrap_' . bin2hex(random_bytes(6));
+            $script = "local r = redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2], 'NX') if r then return r else return nil end";
+            $res = null;
+            try {
+                $res = $predis->eval($script, 1, $bootstrapLockKey, $ownerToken, (string)$bootstrapTtlMs);
+            } catch (Throwable $e) {
+                // failed to eval script - retry after sleep
+            }
+            if ($res !== null) {
+                // acquired bootstrap lock - perform idempotent writes
+                try {
+                    $sources = $registry->getSources();
+                    foreach ($sources as $name => $meta) {
+                        $predis->set('source:' . $name, json_encode($meta));
+                    }
+                } catch (Throwable $e) {
+                    fwrite(STDERR, "Bootstrap write failed: " . $e->getMessage() . PHP_EOL);
+                }
+                // release the bootstrap lock
+                try {
+                    $predis->del($bootstrapLockKey);
+                } catch (Throwable $e) {
+                    // ignore
+                }
+                break;
+            }
+            // failed to acquire lock, sleep 10s and retry per spec
+            fwrite(STDOUT, "Bootstrap lock unavailable; sleeping 10000ms before retrying\n");
+            usleep(10000000);
+        }
     } catch (\Throwable $e) {
         fwrite(STDERR, "Redis lease manager initialization failed: " . $e->getMessage() . PHP_EOL);
         exit(1);
