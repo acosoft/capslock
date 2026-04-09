@@ -31,6 +31,7 @@ final class EventLoader implements EventLoaderInterface
     private int $maxCallDurationMs;
     private bool $running = true;
     private string $ownerId;
+    private string $loaderName;
     private int $loopSleepUs;
 
     public function __construct(
@@ -58,6 +59,7 @@ final class EventLoader implements EventLoaderInterface
         $envMax = getenv('MAX_CALL_DURATION_MS');
         $this->maxCallDurationMs = $envMax !== false ? (int)$envMax : $maxCallDurationMs;
         $this->ownerId = uniqid('loader_', true);
+        $this->loaderName = getenv('LOADER_NAME') ?: $this->ownerId;
         $envLoop = getenv('LOOP_SLEEP_US');
         $this->loopSleepUs = $envLoop !== false ? (int)$envLoop : 100_000;
     }
@@ -81,44 +83,63 @@ final class EventLoader implements EventLoaderInterface
         $sources = $this->registry->getSources();
 
         foreach ($sources as $sourceName => $meta) {
+
+            usleep($this->loopSleepUs);
+
             try {
+                $this->logger->info('attempting to acquire lease for source {source} owner {owner}', ['source' => $sourceName, 'owner' => $this->loaderName]);
                 $acquired = $this->leaseManager->tryAcquireLease($sourceName, $this->ownerId, $this->maxCallDurationMs);
             } catch (LeaseAcquireException $e) {
-                $this->logger->error('Lease acquire failed', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                $this->logger->error('Lease acquire failed for source {source}: {err}', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                // pause before next attempt
+                $ms2 = (int)ceil($this->loopSleepUs / 1000);
+                $this->logger->debug('pausing for {ms}ms after lease error before next source', ['ms' => $ms2]);
+                usleep($this->loopSleepUs);
                 continue;
             }
 
             if (!$acquired) {
                 // someone else owns it
+                $this->logger->debug('lease not acquired for source {source}', ['source' => $sourceName]);
+                // pause before next attempt
+                $ms3 = (int)ceil($this->loopSleepUs / 1000);
+                $this->logger->debug('pausing for {ms}ms after failed acquire before next source', ['ms' => $ms3]);
+                usleep($this->loopSleepUs);
                 continue;
             }
+
+            $this->logger->info('lease acquired for source {source} owner {owner}', ['source' => $sourceName, 'owner' => $this->loaderName]);
 
             try {
                 // authoritative checkpoint from storage
                 $lastStored = $this->storage->fetchLastSourceEventId($sourceName) ?? -1;
 
                 try {
+                    $this->logger->info('fetching events for source {source} after {after}', ['source' => $sourceName, 'after' => $lastStored]);
+                    $startMs = $this->clock->now();
                     $events = $this->client->fetch($sourceName, $lastStored, 1000);
+                    $dur = $this->clock->now() - $startMs;
                 } catch (TransientEventSourceException | PermanentEventSourceException $e) {
-                    $this->logger->error('Source fetch failed', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                    $this->logger->error('Source fetch failed for source {source}: {err}', ['source' => $sourceName, 'err' => $e->getMessage()]);
                     continue;
                 }
 
                 $count = count($events);
                 if ($count === 0) {
                     // no new events — let round-robin continue
-                    $this->logger->info('No new events', ['source' => $sourceName]);
+                    $this->logger->info('no new events for source {source}', ['source' => $sourceName]);
                     continue;
                 }
 
-                // Log only how many events were fetched (per request)
-                $this->logger->info(sprintf('fetched %d events', $count));
+                $this->logger->info('fetched {count} events from source {source} in {ms}ms', ['source' => $sourceName, 'count' => $count, 'ms' => $dur]);
 
                 // store events
                 try {
+                    $this->logger->info('storing {count} events for source {source}', ['source' => $sourceName, 'count' => $count]);
                     $this->storage->storeEvents($sourceName, $events);
+                    $this->logger->info('stored {count} events for source {source}', ['source' => $sourceName, 'count' => $count]);
                 } catch (EventStorageException | TransientStorageException $e) {
-                    $this->logger->error('Storage failed', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                    $this->logger->error('Storage failed for source {source}: {err}', ['source' => $sourceName, 'err' => $e->getMessage()]);
                     continue;
                 }
 
@@ -126,12 +147,22 @@ final class EventLoader implements EventLoaderInterface
                 $last = end($events);
                 if ($last instanceof \App\Model\Event) {
                     $this->cursorStore->setLastStoredSourceEventId($sourceName, $last->sourceEventId);
+                    $this->logger->info('advanced cursor for source {source} to {id}', ['source' => $sourceName, 'id' => $last->sourceEventId]);
                 }
             } finally {
                 try {
                     $this->leaseManager->releaseLease($sourceName, $this->ownerId);
+                    $this->logger->info('released lease for source {source} owner {owner}', ['source' => $sourceName, 'owner' => $this->loaderName]);
                 } catch (LeaseReleaseException $e) {
-                    $this->logger->error('Failed releasing lease', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                    $this->logger->error('Failed releasing lease for source {source}: {err}', ['source' => $sourceName, 'err' => $e->getMessage()]);
+                }
+                // pause between processing sources so logs and external systems can observe throttling
+                try {
+                    $ms = (int)ceil($this->loopSleepUs / 1000);
+                    $this->logger->debug('pausing for {ms}ms before next source', ['ms' => $ms]);
+                    usleep($this->loopSleepUs);
+                } catch (\Throwable $t) {
+                    // ignore sleep errors
                 }
             }
         }

@@ -18,7 +18,14 @@ try {
     $client = new \App\TestDoubles\RandomEventSourceClient();
     $storage = new \App\TestDoubles\InMemoryEventStorage();
     $cursor = new \App\TestDoubles\InMemorySourceCursorStore();
-    $lease = new \App\TestDoubles\InMemorySourceLeaseManager();
+    // prefer Redis-backed lease manager if Predis is available and REDIS_DSN is set
+    $redisDsn = getenv('REDIS_DSN') ?: 'tcp://redis:6379';
+    if (class_exists(\Predis\Client::class)) {
+        $predis = new \Predis\Client($redisDsn);
+        $lease = new \App\Adapter\RedisSourceLeaseManager($predis);
+    } else {
+        $lease = new \App\TestDoubles\InMemorySourceLeaseManager();
+    }
     $clock = new \App\TestDoubles\SystemClock();
 
     $loader = new \App\Service\EventLoader(
