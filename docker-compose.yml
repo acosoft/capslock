@@ -1,12 +1,9 @@
-version: '3.8'
 services:
   loader1:
-    image: php:8.2-cli
+    image: capslock/app:local
+    build:
+      context: .
     container_name: capslock-loader1
-    working_dir: /app
-    volumes:
-      - ./:/app:cached
-    tty: true
     depends_on:
       - redis
     restart: unless-stopped
@@ -15,15 +12,12 @@ services:
       - THROTTLE_MS=8000
       - MAX_CALL_DURATION_MS=300000
       - LOOP_SLEEP_US=5000000
-    command: ["php", "bin/console", "app:event-loader"]
 
   loader2:
-    image: php:8.2-cli
+    image: capslock/app:local
+    build:
+      context: .
     container_name: capslock-loader2
-    working_dir: /app
-    volumes:
-      - ./:/app:cached
-    tty: true
     depends_on:
       - redis
     restart: unless-stopped
@@ -32,8 +26,6 @@ services:
       - THROTTLE_MS=8000
       - MAX_CALL_DURATION_MS=300000
       - LOOP_SLEEP_US=5000000
-    command: ["php", "bin/console", "app:event-loader"]
-
   redis:
     image: redis:7
     ports:

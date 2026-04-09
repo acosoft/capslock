@@ -1,0 +1,31 @@
+services:
+  loader1:
+    image: ghcr.io/acosoft/capslock:latest
+    container_name: capslock-test-loader1
+    depends_on:
+      - redis
+    restart: unless-stopped
+    environment:
+      LOADER_NAME: L1
+      REDIS_DSN: tcp://redis:6379
+      THROTTLE_MS: 8000
+      MAX_CALL_DURATION_MS: 300000
+      LOOP_SLEEP_US: 5000000
+
+  loader2:
+    image: ghcr.io/acosoft/capslock:latest
+    container_name: capslock-test-loader2
+    depends_on:
+      - redis
+    restart: unless-stopped
+    environment:
+      LOADER_NAME: L2
+      REDIS_DSN: tcp://redis:6379
+      THROTTLE_MS: 8000
+      MAX_CALL_DURATION_MS: 300000
+      LOOP_SLEEP_US: 5000000
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
