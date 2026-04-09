@@ -35,5 +35,4 @@ The repository also contains `.github/workflows/publish-image.yml`, which publis
 
 Notes:
 - This is a minimal scaffold. Concrete adapters for Redis, HTTP clients and databases are intentionally out of scope.
-- A direct GHCR push from this local environment was blocked because the current GitHub token is missing the `write:packages` scope. The included GitHub Actions workflow is the reliable path to publish the public image.
 
