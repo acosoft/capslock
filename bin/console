@@ -20,11 +20,12 @@ try {
     $cursor = new \App\TestDoubles\InMemorySourceCursorStore();
     // prefer Redis-backed lease manager if Predis is available and REDIS_DSN is set
     $redisDsn = getenv('REDIS_DSN') ?: 'tcp://redis:6379';
-    if (class_exists(\Predis\Client::class)) {
+    try {
         $predis = new \Predis\Client($redisDsn);
         $lease = new \App\Adapter\RedisSourceLeaseManager($predis);
-    } else {
-        $lease = new \App\TestDoubles\InMemorySourceLeaseManager();
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "Redis lease manager initialization failed: " . $e->getMessage() . PHP_EOL);
+        exit(1);
     }
     $clock = new \App\TestDoubles\SystemClock();
 
